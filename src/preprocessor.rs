@@ -216,6 +216,7 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
     pub fn run(&mut self) -> Result<(), PreprocessorError> {
         let mut in_line = String::with_capacity(80);
         let mut line_written = false;
+        let mut is_in_multiline = false;
 
         loop {
             self.line_num += 1;
@@ -230,8 +231,11 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
             }
 
             // Prevent mangling of multiline comments
-            if in_line.contains(MULTILINE_COMMENT_START_DELEM) && !in_line.contains(MULTILINE_COMMENT_END_DELEM) {
+            if (is_in_multiline ||in_line.contains(MULTILINE_COMMENT_START_DELEM)) && !in_line.contains(MULTILINE_COMMENT_END_DELEM) {
+                is_in_multiline = true;
                 continue;
+            } else {
+                is_in_multiline = false;
             }
 
             let in_line_no_comments = COMMENT_REGEX.replace_all(&in_line, "");
@@ -552,7 +556,8 @@ mod tests {
 BufReader::new(r#"#include "include/test.h"
 
 /* This is a test of all basic
- * preprocessor functionality and stuff */
+ * preprocessor functionality
+ * and stuff */
 
 int main ( void ) {
     printf ( HELLO ) ;
