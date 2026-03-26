@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::fmt::{Debug, Display, Formatter, write};
+use std::fmt::{Debug, Display, Formatter};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::io::Error as IoError;
@@ -20,8 +20,9 @@ pub const INCLUDE_START_DELEM: char = '<';
 pub const INCLUDE_END_DELEM: char = '>';
 pub const MULTILINE_COMMENT_START_DELEM: &str = "/*";
 pub const MULTILINE_COMMENT_END_DELEM: &str = "*/";
+pub const PARAM_STRINGIFY_DELEM: char = '#';
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub enum Directive {
     Unknown,
     Include,
@@ -36,7 +37,9 @@ pub enum Directive {
 static DIRECTIVE_MAP: LazyLock<HashMap<&'static str, Directive>> = LazyLock::new(|| {
     HashMap::from_iter([
         ("INCLUDE", Directive::Include),
-        ("DEFINE", Directive::Define)
+        ("DEFINE", Directive::Define),
+        ("UNDEF", Directive::Undef),
+        ("ERROR", Directive::Error),
     ].into_iter())
 });
 
@@ -60,6 +63,14 @@ pub enum PpErrId {
     UnclosedString,
     UnexpectedEof,
     FileNotFound(String),
+    UnknownDefine(String),
+    ErrorDirective(String)
+}
+
+impl PartialEq for PpErrId {
+    fn eq(&self, other: &Self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
 }
 
 impl Display for PpErrId {
@@ -68,6 +79,7 @@ impl Display for PpErrId {
             PpErrId::Io(e) => write!(f, "io error: {}", e),
             PpErrId::UnknownDirective(directive) => write!(f, "unknown directive '{}'", directive),
             PpErrId::UnknownParam(param) => write!(f, "unknown param '{}'", param),
+            PpErrId::UnknownDefine(param) => write!(f, "unknown define '{}'", param),
             PpErrId::UnexpectedToken(token) => write!(f, "unexpected token '{}'", token),
             PpErrId::DefineMissingToken => write!(f, "define is missing a token"),
             PpErrId::MissingParenthesis => write!(f, "macro missing parenthesis"),
@@ -76,6 +88,7 @@ impl Display for PpErrId {
             PpErrId::UnclosedString => write!(f, "unclosed string"),
             PpErrId::UnexpectedEof => write!(f, "unexpected end of file"),
             PpErrId::FileNotFound(filename) => write!(f, "unable to find '{}'", filename),
+            PpErrId::ErrorDirective(error) => write!(f, "error directive: {}", error),
         }
     }
 }
@@ -86,6 +99,7 @@ impl Debug for PpErrId {
     }
 }
 
+#[derive(PartialEq)]
 pub struct PreprocessorError {
     line_num: usize,
     id: PpErrId,
@@ -104,12 +118,20 @@ impl Debug for PreprocessorError {
 }
 
 impl PreprocessorError {
+    pub fn error_directive(line_num: usize, e: String) -> Self {
+        Self { line_num, id: PpErrId::ErrorDirective(e) }
+    }
+
     pub fn io(line_num: usize, e: IoError) -> Self {
         Self { line_num, id: PpErrId::Io(e) }
     }
 
     pub fn unknown_directive(line_num: usize, directive: &str) -> Self {
         Self { line_num, id: PpErrId::UnknownDirective(directive.to_string()) }
+    }
+
+    pub fn unknown_define(line_num: usize, define: &str) -> Self {
+        Self { line_num, id: PpErrId::UnknownDefine(define.to_string()) }
     }
 
     pub fn unknown_param(line_num: usize, param: &str) -> Self {
@@ -149,11 +171,18 @@ impl PreprocessorError {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ParamInstance {
+    pub param_key: String,
+    pub quote: bool,
+    pub i_insert: usize,
+}
+
 #[derive(Debug)]
 pub struct Define {
-    pub params: Option<HashMap<String, usize>>,
+    pub param_map: Option<HashMap<String, usize>>,
     /// Params will be placed in between each body vec string
-    pub param_instances: Option<Vec<String>>,
+    pub param_instances: Option<Vec<ParamInstance>>,
     pub body: Vec<String>,
 }
 
@@ -164,10 +193,12 @@ impl Define {
         }
 
         let params = params.unwrap();
+        let param_map = self.param_map.as_ref().unwrap();
+        let param_instances = self.param_instances.as_ref().unwrap();
 
         let mut out = String::with_capacity(80);
 
-        for (i_param, body_string) in self.body.iter().enumerate() {
+        for (i_param_instance, body_string) in self.body.iter().enumerate() {
             if !out.is_empty() {
                 out.push(' ');
             }
@@ -178,9 +209,20 @@ impl Define {
                 out.push(' ');
             }
 
-            let param_string = params.get(i_param).ok_or(PreprocessorError::missing_parameter(line_num))?;
+            let param_instance = param_instances.get(i_param_instance).unwrap();
 
-            out.push_str(param_string);
+            let i_param = param_map.get(&param_instance.param_key).unwrap();
+
+            let param_string = params.get(*i_param).ok_or(PreprocessorError::missing_parameter(line_num))?;
+
+            match param_instance.quote {
+                true => {
+                    out.push('"');
+                    out.push_str(param_string);
+                    out.push('"');
+                }
+                false => { out.push_str(param_string); }
+            }
         }
 
         Ok(out)
@@ -264,7 +306,7 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
                     }
                     Directive::Define => {
                         let token = tokens.pop_front().ok_or(PreprocessorError::define_missing_token(self.line_num))?;
-                        let has_params = tokens.front().unwrap_or(&"").contains(PARAM_START_DELEM);
+                        let has_params = tokens.front().unwrap_or(&"").starts_with(PARAM_START_DELEM);
 
                         let params = match has_params {
                             true => {
@@ -289,51 +331,46 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
 
                             let mut i_last_split = 0;
 
-                            for (param, i_param) in instances {
-                                let i_split = i_param - i_last_split;
+                            for param_instance in instances {
+                                let i_split = param_instance.i_insert - i_last_split;
+                                i_last_split = param_instance.i_insert;
 
                                 let new_tokens = tokens.split_off(i_split);
                                 let body_string = self.preprocess_tokens(tokens, false)?;
 
                                 body.push(body_string);
-                                param_instances.get_or_insert(Vec::with_capacity(param_count)).push(param);
+                                param_instances.get_or_insert(Vec::with_capacity(param_count)).push(param_instance);
 
                                 tokens = new_tokens;
-                                i_last_split = i_param;
                             }
                         } else {
                             body.push(self.preprocess_tokens(tokens, false)?)
                         }
 
-                        let define = Define { params, param_instances, body };
+                        let define = Define { param_map: params, param_instances, body };
 
                         self.defines.insert(token.to_string(), define);
                     }
-                    Directive::Include => {
-                        let filename_seq = self.preprocess_tokens(tokens, true)?;
+                    Directive::Undef => {
+                        let token = tokens.pop_front().ok_or(PreprocessorError::define_missing_token(self.line_num))?;
 
-                        let seq_close_char = match filename_seq.starts_with(STRING_DELEM) {
-                            true => STRING_DELEM,
-                            false => {
-                                if !filename_seq.starts_with(INCLUDE_START_DELEM) {
-                                    return Err(PreprocessorError::unexpected_token(self.line_num, &filename_seq));
-                                }
-
-                                INCLUDE_END_DELEM
-                            }
-                        };
-
-                        if !filename_seq.ends_with(seq_close_char) {
-                            return Err(PreprocessorError::unclosed_string(self.line_num));
+                        if self.defines.remove(token).is_none() {
+                            return Err(PreprocessorError::unknown_define(self.line_num, token))
                         }
+                    }
+                    Directive::Include => {
+                        let rev_priority = tokens.front().unwrap_or(&"").starts_with(STRING_DELEM);
 
-                        let rev_priority = seq_close_char == STRING_DELEM;
-
-                        let filename = PathBuf::from(&filename_seq[1..filename_seq.len() - 1]);
+                        let filename = PathBuf::from(self.get_string_from_tokens(tokens, true)?);
 
                         log::debug!("Including file {}", filename.as_os_str().to_str().unwrap());
 
                         self.include_file(filename, rev_priority)?;
+                    }
+                    Directive::Error => {
+                        let error = self.get_string_from_tokens(tokens, false)?;
+
+                        return Err(PreprocessorError::error_directive(self.line_num, error));
                     }
                     _ => {
                         todo!()
@@ -354,6 +391,29 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
 
             in_line.clear();
         } 
+    }
+
+    fn get_string_from_tokens(&self, tokens: VecDeque<&str>, is_in_include_dir: bool) -> Result<String, PreprocessorError> {
+        let string_seq = self.preprocess_tokens(tokens, true)?;
+
+        let seq_close_char = match string_seq.starts_with(STRING_DELEM) {
+            true => STRING_DELEM,
+            false => {
+                if !is_in_include_dir || !string_seq.starts_with(INCLUDE_START_DELEM) {
+                    return Err(PreprocessorError::unexpected_token(self.line_num, &string_seq));
+                }
+
+                INCLUDE_END_DELEM
+            }
+        };
+
+        if !string_seq.ends_with(seq_close_char) {
+            return Err(PreprocessorError::unclosed_string(self.line_num));
+        }
+
+        let string = string_seq[1..string_seq.len() - 1].to_owned();
+
+        Ok(string)
     }
 
     /// `#include <foo.h>` is normal priority and searches include directories first
@@ -387,7 +447,7 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
         Err(PreprocessorError::file_not_found(self.line_num, filename))
     }
 
-    fn remove_params<'a>(&mut self, tokens: VecDeque<&'a str>, params: &HashMap<String, usize>) -> Result<(VecDeque<&'a str>, Vec<(String, usize)>), PreprocessorError> {
+    fn remove_params<'a>(&mut self, tokens: VecDeque<&'a str>, params: &HashMap<String, usize>) -> Result<(VecDeque<&'a str>, Vec<ParamInstance>), PreprocessorError> {
         let mut out_tokens = VecDeque::with_capacity(tokens.len());
         let mut param_instances = Vec::with_capacity(params.len());
 
@@ -395,31 +455,40 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
         let mut is_in_string = false;
         let mut escape_next = false;
 
-        for (i_token, token) in tokens.into_iter().enumerate() {
-            if token.contains(STRING_DELEM) && !escape_next {
+        for (i_token, mut token) in tokens.into_iter().enumerate() {
+            if token.starts_with(STRING_DELEM) && !escape_next {
                 is_in_string = !is_in_string;
+            }
+            
+            let quote = token.starts_with(PARAM_STRINGIFY_DELEM);
+            if quote {
+                token = &token[1..];
             }
 
             if !is_in_string && params.contains_key(token) {
-
-                param_instances.push((token.to_string(), i_token - split_count));
+                param_instances.push(ParamInstance { param_key: token.to_string(), quote: quote, i_insert: i_token - split_count });
                 split_count += 1;
             } else {
+                if quote {
+                    return Err(PreprocessorError::unexpected_token(self.line_num, PARAM_STRINGIFY_DELEM.to_string().as_str()))
+                }
+
                 out_tokens.push_back(token);
             }
             
-            if token.contains(ESCAPE_DELEM) && !escape_next {
+            if token.starts_with(ESCAPE_DELEM) && !escape_next {
                 escape_next = true;
             } else {
                 escape_next = false;
             }
+
         }
 
         Ok((out_tokens, param_instances))
     }
 
     /// Set is_in_include_dir to treat "<" and ">" as string delemiters
-    fn preprocess_tokens(&mut self, mut tokens: VecDeque<&str>, is_in_include_dir: bool) -> Result<String, PreprocessorError> {
+    fn preprocess_tokens(&self, mut tokens: VecDeque<&str>, is_in_include_dir: bool) -> Result<String, PreprocessorError> {
         let mut out = String::with_capacity(80);
 
         // Ignore defines when in strings
@@ -436,11 +505,11 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
                 out.push(' ');
             }
 
-            if token.contains(STRING_DELEM) && !escape_next {
+            if token.starts_with(STRING_DELEM) && !escape_next {
                 is_in_string = !is_in_string;
             }
 
-            if is_in_include_dir && token.contains(INCLUDE_START_DELEM) {
+            if is_in_include_dir && token.starts_with(INCLUDE_START_DELEM) {
                 if is_in_string {
                     return Err(PreprocessorError::unexpected_token(self.line_num, &INCLUDE_START_DELEM.to_string()));
                 }
@@ -448,7 +517,7 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
                 is_in_string = true;
             }
             
-            if is_in_include_dir && token.contains(INCLUDE_END_DELEM) {
+            if is_in_include_dir && token.starts_with(INCLUDE_END_DELEM) {
                 if !is_in_string {
                     return Err(PreprocessorError::unexpected_token(self.line_num, &INCLUDE_END_DELEM.to_string()));
                 }
@@ -457,7 +526,7 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
             }
                 
             if let Some(define) = self.defines.get(token) && !is_in_string {
-                let params = match define.params.is_some() {
+                let params = match define.param_map.is_some() {
                     true => Some(self.get_params(&mut tokens)?),
                     false => None,
                 };
@@ -466,7 +535,7 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
                 out.push_str(token);
             }
 
-            if token.contains(ESCAPE_DELEM) && !escape_next {
+            if token.starts_with(ESCAPE_DELEM) && !escape_next {
                 escape_next = true;
             } else {
                 escape_next = false;
@@ -477,7 +546,7 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
     }
 
     fn get_params(&self, tokens: &mut VecDeque<&str>) -> Result<Vec<String>, PreprocessorError> {
-        if tokens.pop_front().map(|x: &str| !x.contains(PARAM_START_DELEM)).unwrap_or(true) {
+        if tokens.pop_front().map(|x: &str| !x.starts_with(PARAM_START_DELEM)).unwrap_or(true) {
             return Err(PreprocessorError::missing_parenthesis(self.line_num));
         }
 
@@ -488,12 +557,12 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
         loop {
             let token = tokens.pop_front().ok_or(PreprocessorError::unclosed_parenthesis(self.line_num))?;
 
-            if token.contains(PARAM_START_DELEM) {
+            if token.starts_with(PARAM_START_DELEM) {
                 depth += 1;
                 continue;
             }
 
-            if token.contains(PARAM_END_DELEM) {
+            if token.starts_with(PARAM_END_DELEM) {
                 if depth == 0 {
                     params.push(current_param);
 
@@ -504,7 +573,7 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
                 continue;
             }
 
-            if token.contains(PARAM_SEP_DELEM) && depth == 0 {
+            if token.starts_with(PARAM_SEP_DELEM) && depth == 0 {
                 params.push(current_param.clone());
                 current_param.clear();
                 continue;
@@ -548,13 +617,11 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
 mod tests {
     use std::io::{BufReader, BufWriter};
 
-    use crate::preprocessor::Preprocessor;
+    use crate::preprocessor::{Preprocessor, PreprocessorError};
     
     #[test]
     fn test_preprocessor_hello_world() {
-        let mut test_in =
-BufReader::new(r#"#include "include/test.h"
-
+        let mut test_in = BufReader::new(r#"#include "include/test.h"
 /* This is a test of all basic
  * preprocessor functionality
  * and stuff */
@@ -618,9 +685,22 @@ printf ( "Hello, World!" ) ;
     
     #[test]
     fn test_preprocessor_define_multi_param() {
-        let mut test_in = BufReader::new("#define bar(bax, boo, boing) bax + boo + boing\nstatic char foo = bar(1, 123, 12345);".as_bytes());
+        let mut test_in = BufReader::new("#define bar(bax, boo, boing) bax + boo + boing + boo\nstatic char foo = bar(1, 123, 12345);".as_bytes());
         let mut test_out = BufWriter::new(Vec::new());
-        let test_expected = "static char foo = 1 + 123 + 12345 ;";
+        let test_expected = "static char foo = 1 + 123 + 12345 + 123 ;";
+
+        let mut preprocessor = Preprocessor::new(&mut test_in, &mut test_out);
+
+        preprocessor.run().unwrap();
+
+        assert_eq!(test_expected, str::from_utf8(&test_out.into_inner().unwrap()).unwrap());
+    }
+    
+#[test]
+    fn test_preprocessor_define_multi_param_stringify() {
+        let mut test_in = BufReader::new("#define bar(bax, boo, boing) #bax + #boo + #boing + #boo\nstatic char foo = bar(1, 123, 12345);".as_bytes());
+        let mut test_out = BufWriter::new(Vec::new());
+        let test_expected = "static char foo = \"1\" + \"123\" + \"12345\" + \"123\" ;";
 
         let mut preprocessor = Preprocessor::new(&mut test_in, &mut test_out);
 
@@ -657,14 +737,27 @@ printf ( "Hello, World!" ) ;
     
     #[test]
     fn test_preprocessor_define_multi_line_multi_param() {
-        let mut test_in = BufReader::new("#define bar(bax, boo, boing) bax + boo + \\\n boing\nstatic char foo = bar(1, 123, 12345);".as_bytes());
+        let mut test_in = BufReader::new("#define bar(bax, boo, boing) boo + bax + \\\n boing\nstatic char foo = bar(1, 123, 12345);".as_bytes());
         let mut test_out = BufWriter::new(Vec::new());
-        let test_expected = "static char foo = 1 + 123 + 12345 ;";
+        let test_expected = "static char foo = 123 + 1 + 12345 ;";
 
         let mut preprocessor = Preprocessor::new(&mut test_in, &mut test_out);
 
         preprocessor.run().unwrap();
 
         assert_eq!(test_expected, str::from_utf8(&test_out.into_inner().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn test_preprocessor_error_directive() {
+        let mut test_in = BufReader::new("#error \"foo\"".as_bytes());
+        let mut test_out = BufWriter::new(Vec::new());
+        let test_expected = PreprocessorError::error_directive(1, "foo".to_string());
+
+        let mut preprocessor = Preprocessor::new(&mut test_in, &mut test_out);
+
+        let result = preprocessor.run().unwrap_err();
+
+        assert_eq!(test_expected, result);
     }
 }
