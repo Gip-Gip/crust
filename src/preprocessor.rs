@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::io::Error as IoError;
 use std::iter::once_with;
 use std::path::PathBuf;
-use std::sync::{LazyLock};
+use std::sync::{Arc, LazyLock};
 
 use crate::{COMMENT_REGEX, OPERATOR_REGEX, split_whitespace_quote_respecting};
 
@@ -22,6 +22,20 @@ pub const MULTILINE_COMMENT_START_DELEM: &str = "/*";
 pub const MULTILINE_COMMENT_END_DELEM: &str = "*/";
 pub const PARAM_STRINGIFY_DELEM: char = '#';
 
+fn combine_tokens_into_string<'a, TokenIter: Iterator<Item = &'a String>>(tokens: TokenIter, separator: &str) -> String {
+    let mut out = String::with_capacity(80);
+
+    for token in tokens {
+        if !out.is_empty() {
+            out.push_str(separator);
+        }
+
+        out.push_str(token);
+    }
+
+    out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub enum Directive {
     Unknown,
@@ -31,6 +45,8 @@ pub enum Directive {
     If,
     IfDef,
     IfNDef,
+    Else,
+    EndIf,
     Error,
 }
 
@@ -39,6 +55,10 @@ static DIRECTIVE_MAP: LazyLock<HashMap<&'static str, Directive>> = LazyLock::new
         ("INCLUDE", Directive::Include),
         ("DEFINE", Directive::Define),
         ("UNDEF", Directive::Undef),
+        ("IFDEF", Directive::IfDef),
+        ("IFNDEF", Directive::IfNDef),
+        ("ELSE", Directive::Else),
+        ("ENDIF", Directive::EndIf),
         ("ERROR", Directive::Error),
     ].into_iter())
 });
@@ -171,6 +191,8 @@ impl PreprocessorError {
     }
 }
 
+pub type Tokens = Vec<String>;
+
 #[derive(Debug, Clone)]
 pub struct ParamInstance {
     pub param_key: String,
@@ -183,45 +205,35 @@ pub struct Define {
     pub param_map: Option<HashMap<String, usize>>,
     /// Params will be placed in between each body vec string
     pub param_instances: Option<Vec<ParamInstance>>,
-    pub body: Vec<String>,
+    pub body: Vec<Tokens>,
 }
 
 impl Define {
-    pub fn body_to_string(&self, line_num: usize, params: Option<Vec<String>>) -> Result<String, PreprocessorError> {
+    pub fn body_to_tokens(&self, line_num: usize, params: Option<Vec<Tokens>>) -> Result<Tokens, PreprocessorError> {
         if params.as_ref().map(|x: &Vec<_>| x.len()).unwrap_or_default() == 0 {
-            return Ok(self.body.first().unwrap_or(&String::new()).clone());
+            return Ok(self.body.first().unwrap_or(&Vec::new()).clone());
         }
 
         let params = params.unwrap();
         let param_map = self.param_map.as_ref().unwrap();
         let param_instances = self.param_instances.as_ref().unwrap();
 
-        let mut out = String::with_capacity(80);
+        let mut out = Vec::with_capacity(80);
 
-        for (i_param_instance, body_string) in self.body.iter().enumerate() {
-            if !out.is_empty() {
-                out.push(' ');
-            }
-
-            out.push_str(body_string);
-
-            if !out.is_empty() {
-                out.push(' ');
-            }
+        for (i_param_instance, body_tokens) in self.body.iter().enumerate() {
+            out.extend_from_slice(body_tokens);
 
             let param_instance = param_instances.get(i_param_instance).unwrap();
 
             let i_param = param_map.get(&param_instance.param_key).unwrap();
 
-            let param_string = params.get(*i_param).ok_or(PreprocessorError::missing_parameter(line_num))?;
+            let param_tokens = params.get(*i_param).ok_or(PreprocessorError::missing_parameter(line_num))?;
 
             match param_instance.quote {
                 true => {
-                    out.push('"');
-                    out.push_str(param_string);
-                    out.push('"');
+                    out.push(format!("\"{}\"", combine_tokens_into_string(param_tokens.into_iter(), " ")));
                 }
-                false => { out.push_str(param_string); }
+                false => { out.extend_from_slice(param_tokens); }
             }
         }
 
@@ -229,24 +241,64 @@ impl Define {
     }
 }
 
-pub struct Preprocessor<'istr, 'ostr, In: Read, Out: Write> {
+#[derive(Debug, PartialEq)]
+pub struct LineTokenGroup {
+    pub line_num: usize,
+    pub file_name: Arc<String>,
+    pub tokens: Vec<String>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct PreprocessorOut {
+    token_groups: Vec<LineTokenGroup>,
+}
+
+impl PreprocessorOut {
+    pub fn new() -> Self {
+        Self {
+            token_groups: Vec::with_capacity(128),
+        }
+    }
+
+    pub fn push_line(&mut self, line_num: usize, file_name: Arc<String>, tokens: Vec<String>) {
+        self.token_groups.push(LineTokenGroup { line_num, file_name, tokens });
+    }
+
+    pub fn write_to<Out: Write>(&self, mut out: Out) -> Result<(), IoError>{
+        let mut line_written = false;
+
+        for token_group in self.token_groups.iter() {
+            if line_written {
+                writeln!(out, "")?;
+            } else {
+                line_written = true;
+            }
+
+            write!(out, "{}", combine_tokens_into_string(token_group.tokens.iter(), " "))?
+        }
+
+        Ok(())
+    }
+}
+
+pub struct Preprocessor<'istr, In: Read> {
     in_stream: &'istr mut BufReader<In>,
-    out_stream: &'ostr mut BufWriter<Out>,
+    in_file_name: Arc<String>,
     defines: HashMap<String, Define>,
     include_dirs: Vec<PathBuf>,
     /// Incremented as the preprocessor goes through the in stream
     line_num: usize,
 }
 
-impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, Out> {
-    pub fn new(in_stream: &'istr mut BufReader<In>, out_stream: &'ostr mut BufWriter<Out>) -> Self {
+impl<'istr, In: Read> Preprocessor<'istr, In> {
+    pub fn new(in_stream: &'istr mut BufReader<In>, in_file_name: &str) -> Self {
         let include_dirs = vec!["./include/".into()];
 
         Self {
             in_stream: in_stream,
-            out_stream: out_stream,
             defines: HashMap::with_capacity(16),
             include_dirs,
+            in_file_name: Arc::new(in_file_name.to_string()),
             line_num: 0,
         }
     }
@@ -255,10 +307,11 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
         self.defines
     }
 
-    pub fn run(&mut self) -> Result<(), PreprocessorError> {
+    pub fn run(&mut self) -> Result<PreprocessorOut, PreprocessorError> {
         let mut in_line = String::with_capacity(80);
-        let mut line_written = false;
         let mut is_in_multiline = false;
+
+        let mut out = PreprocessorOut::new();
 
         loop {
             self.line_num += 1;
@@ -269,7 +322,7 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
                     PreprocessorError::unexpected_eof(self.line_num);
                 }
 
-                return Ok(());
+                return Ok(out);
             }
 
             // Prevent mangling of multiline comments
@@ -304,53 +357,7 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
                     Directive::Unknown => {
                         return Err(PreprocessorError::unknown_directive(self.line_num, directive_str));
                     }
-                    Directive::Define => {
-                        let token = tokens.pop_front().ok_or(PreprocessorError::define_missing_token(self.line_num))?;
-                        let has_params = tokens.front().unwrap_or(&"").starts_with(PARAM_START_DELEM);
-
-                        let params = match has_params {
-                            true => {
-                                let params = self.get_params(&mut tokens)?;
-
-                                let params_iter = params
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i_param, param)| (param.clone(), i_param));
-                                
-                                Some(HashMap::from_iter(params_iter))
-                            },
-                            false => None,
-                        };
-
-                        let param_count = params.as_ref().map(|x: &HashMap<_, _>| x.len()).unwrap_or_default();
-                        let mut body = Vec::with_capacity(param_count + 1);
-                        let mut param_instances = None;
-                       
-                        if let Some(params) = &params {
-                            let (mut tokens, instances) = self.remove_params(tokens, params)?; 
-
-                            let mut i_last_split = 0;
-
-                            for param_instance in instances {
-                                let i_split = param_instance.i_insert - i_last_split;
-                                i_last_split = param_instance.i_insert;
-
-                                let new_tokens = tokens.split_off(i_split);
-                                let body_string = self.preprocess_tokens(tokens, false)?;
-
-                                body.push(body_string);
-                                param_instances.get_or_insert(Vec::with_capacity(param_count)).push(param_instance);
-
-                                tokens = new_tokens;
-                            }
-                        } else {
-                            body.push(self.preprocess_tokens(tokens, false)?)
-                        }
-
-                        let define = Define { param_map: params, param_instances, body };
-
-                        self.defines.insert(token.to_string(), define);
-                    }
+                    Directive::Define => { self.process_define(tokens)?; },
                     Directive::Undef => {
                         let token = tokens.pop_front().ok_or(PreprocessorError::define_missing_token(self.line_num))?;
 
@@ -377,24 +384,70 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
                     }
                 }
             } else {
-                let out_string = self.preprocess_tokens(tokens, false)?;
+                let out_tokens = self.preprocess_tokens(tokens, false)?;
 
-                // If we have already written a line, prefix this line with a newline
-                if line_written {
-                    write!(self.out_stream, "\n").map_err(|e| PreprocessorError::io(self.line_num, e))?;
-                }
-
-                write!(self.out_stream, "{}", out_string).map_err(|e| PreprocessorError::io(self.line_num, e))?;
-
-                line_written = true;
+                out.push_line(self.line_num, self.in_file_name.clone(), out_tokens);
             }
 
             in_line.clear();
         } 
     }
 
+    fn process_define(&mut self, mut tokens: VecDeque<&str>) -> Result<(), PreprocessorError> {
+        let token = tokens.pop_front().ok_or(PreprocessorError::define_missing_token(self.line_num))?;
+        let has_params = tokens.front().unwrap_or(&"").starts_with(PARAM_START_DELEM);
+
+        let params = match has_params {
+            true => {
+                let params = self.get_params(&mut tokens)?;
+
+                let params_iter = params
+                    .iter()
+                    .enumerate()
+                    .map(|(i_param, param)| {
+                        let param_name: String = param.iter().map(|x| x.clone()).collect();
+                        (param_name, i_param)
+                    });
+                
+                Some(HashMap::from_iter(params_iter))
+            },
+            false => None,
+        };
+
+        let param_count = params.as_ref().map(|x: &HashMap<_, _>| x.len()).unwrap_or_default();
+        let mut body = Vec::with_capacity(param_count + 1);
+        let mut param_instances = None;
+        
+        if let Some(params) = &params {
+            let (mut tokens, instances) = self.remove_params(tokens, params)?; 
+
+            let mut i_last_split = 0;
+
+            for param_instance in instances {
+                let i_split = param_instance.i_insert - i_last_split;
+                i_last_split = param_instance.i_insert;
+
+                let new_tokens = tokens.split_off(i_split);
+                let body_string = self.preprocess_tokens(tokens, false)?;
+
+                body.push(body_string);
+                param_instances.get_or_insert(Vec::with_capacity(param_count)).push(param_instance);
+
+                tokens = new_tokens;
+            }
+        } else {
+            body.push(self.preprocess_tokens(tokens, false)?)
+        }
+
+        let define = Define { param_map: params, param_instances, body };
+
+        self.defines.insert(token.to_string(), define);
+
+        Ok(())
+    }
+
     fn get_string_from_tokens(&self, tokens: VecDeque<&str>, is_in_include_dir: bool) -> Result<String, PreprocessorError> {
-        let string_seq = self.preprocess_tokens(tokens, true)?;
+        let string_seq: String = self.preprocess_tokens(tokens, true)?.iter().map(|x| x.clone()).collect();
 
         let seq_close_char = match string_seq.starts_with(STRING_DELEM) {
             true => STRING_DELEM,
@@ -429,9 +482,9 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
                 path.push(filename.clone());
 
                 if path.is_file() {
-                    let mut in_stream = BufReader::new(File::open(path).map_err(|e| PreprocessorError::io(self.line_num, e))?);
+                    let mut in_stream = BufReader::new(File::open(path.clone()).map_err(|e| PreprocessorError::io(self.line_num, e))?);
 
-                    let mut include_preprocessor = Preprocessor::new(&mut in_stream, self.out_stream);
+                    let mut include_preprocessor = Preprocessor::new(&mut in_stream, path.to_str().unwrap_or_default());
 
                     include_preprocessor.run()?;
 
@@ -461,12 +514,13 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
             }
             
             let quote = token.starts_with(PARAM_STRINGIFY_DELEM);
+
             if quote {
                 token = &token[1..];
             }
 
             if !is_in_string && params.contains_key(token) {
-                param_instances.push(ParamInstance { param_key: token.to_string(), quote: quote, i_insert: i_token - split_count });
+                param_instances.push(ParamInstance { param_key: token.to_string(), quote, i_insert: i_token - split_count });
                 split_count += 1;
             } else {
                 if quote {
@@ -488,11 +542,11 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
     }
 
     /// Set is_in_include_dir to treat "<" and ">" as string delemiters
-    fn preprocess_tokens(&self, mut tokens: VecDeque<&str>, is_in_include_dir: bool) -> Result<String, PreprocessorError> {
-        let mut out = String::with_capacity(80);
+    fn preprocess_tokens(&self, mut tokens: VecDeque<&str>, is_in_include_dir: bool) -> Result<Tokens, PreprocessorError> {
+        let mut out = Vec::with_capacity(80);
 
         // Ignore defines when in strings
-        let mut is_in_string = false;
+        let mut string_combination_buffer = String::with_capacity(80);
         let mut escape_next = false;
 
         loop {
@@ -501,38 +555,42 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
                 None => {break;},
             };
 
-            if !out.is_empty() && !out.ends_with(' ') && !is_in_string {
-                out.push(' ');
-            }
+            let is_string_delem = token.starts_with(STRING_DELEM) || (is_in_include_dir && (token.starts_with(INCLUDE_START_DELEM) || token.starts_with(INCLUDE_END_DELEM)));
 
-            if token.starts_with(STRING_DELEM) && !escape_next {
-                is_in_string = !is_in_string;
-            }
+            // Combine strings into one token
+            if is_string_delem && !escape_next {
+                if !string_combination_buffer.is_empty() {
+                    string_combination_buffer.push_str(token);
+                    if is_in_include_dir && token.starts_with(INCLUDE_START_DELEM) {
+                        return Err(PreprocessorError::unexpected_token(self.line_num, &INCLUDE_START_DELEM.to_string()));
+                    }
+                    
+                    if is_in_include_dir && token.starts_with(INCLUDE_END_DELEM) {
+                        return Err(PreprocessorError::unexpected_token(self.line_num, &INCLUDE_END_DELEM.to_string()));
+                    }
 
-            if is_in_include_dir && token.starts_with(INCLUDE_START_DELEM) {
-                if is_in_string {
-                    return Err(PreprocessorError::unexpected_token(self.line_num, &INCLUDE_START_DELEM.to_string()));
+                    out.push(string_combination_buffer.clone());
+
+                    string_combination_buffer.clear();
+
+                    continue;
                 }
-
-                is_in_string = true;
+                
+                string_combination_buffer.push_str(token);
+            } else if !string_combination_buffer.is_empty() {
+                string_combination_buffer.push_str(token);
             }
-            
-            if is_in_include_dir && token.starts_with(INCLUDE_END_DELEM) {
-                if !is_in_string {
-                    return Err(PreprocessorError::unexpected_token(self.line_num, &INCLUDE_END_DELEM.to_string()));
-                }
 
-                is_in_string = false;
-            }
+            let is_in_string = !string_combination_buffer.is_empty();
                 
             if let Some(define) = self.defines.get(token) && !is_in_string {
                 let params = match define.param_map.is_some() {
                     true => Some(self.get_params(&mut tokens)?),
                     false => None,
                 };
-                out.push_str(define.body_to_string(self.line_num, params)?.as_str());
-            } else {
-                out.push_str(token);
+                out.append(&mut define.body_to_tokens(self.line_num, params)?);
+            } else if !is_in_string {
+                out.push(token.to_string());
             }
 
             if token.starts_with(ESCAPE_DELEM) && !escape_next {
@@ -545,13 +603,13 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
         Ok(out)
     }
 
-    fn get_params(&self, tokens: &mut VecDeque<&str>) -> Result<Vec<String>, PreprocessorError> {
+    fn get_params(&self, tokens: &mut VecDeque<&str>) -> Result<Vec<Tokens>, PreprocessorError> {
         if tokens.pop_front().map(|x: &str| !x.starts_with(PARAM_START_DELEM)).unwrap_or(true) {
             return Err(PreprocessorError::missing_parenthesis(self.line_num));
         }
 
         let mut params = Vec::with_capacity(4);
-        let mut current_param = String::with_capacity(16);
+        let mut current_param = Vec::with_capacity(16);
         let mut depth = 0;
 
         loop {
@@ -579,7 +637,7 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
                 continue;
             }
 
-            current_param.push_str(token);
+            current_param.push(token.to_owned());
         }
     }
 
@@ -615,9 +673,9 @@ impl<'istr, 'ostr, In: Read, Out: Write + Debug> Preprocessor<'istr, 'ostr, In, 
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufReader, BufWriter};
+    use std::{io::{BufReader, BufWriter}, sync::Arc};
 
-    use crate::preprocessor::{Preprocessor, PreprocessorError};
+    use crate::preprocessor::{LineTokenGroup, Preprocessor, PreprocessorError, PreprocessorOut};
     
     #[test]
     fn test_preprocessor_hello_world() {
@@ -631,16 +689,43 @@ int main ( void ) {
 }"#.as_bytes());
         let mut test_out = BufWriter::new(Vec::new());
         // The preprocessor also removes redundant whitespace
-        let test_expected =
+        let string_expected =
 r#"int main ( void ) {
 printf ( "Hello, World!" ) ;
 }"#;
 
-        let mut preprocessor = Preprocessor::new(&mut test_in, &mut test_out);
+        let file_name = Arc::new("".to_string());
 
-        preprocessor.run().unwrap();
+        let ppout_expected = PreprocessorOut { token_groups: vec![
+            LineTokenGroup { line_num: 6, file_name: file_name.clone(), tokens: vec![
+                "int".to_string(),
+                "main".to_string(),
+                "(".to_string(),
+                "void".to_string(),
+                ")".to_string(),
+                "{".to_string(),
+            ] },
+            LineTokenGroup { line_num: 7, file_name: file_name.clone(), tokens: vec![
+                "printf".to_string(),
+                "(".to_string(),
+                "\"Hello, World!\"".to_string(),
+                ")".to_string(),
+                ";".to_string(),
+            ] },
+            LineTokenGroup { line_num: 8, file_name: file_name.clone(), tokens: vec![
+                "}".to_string(),
+            ] },
+        ]};
 
-        assert_eq!(test_expected, str::from_utf8(&test_out.into_inner().unwrap()).unwrap());
+        let mut preprocessor = Preprocessor::new(&mut test_in, "");
+
+        let ppout = preprocessor.run().unwrap();
+
+        assert_eq!(ppout, ppout_expected);
+
+        ppout.write_to(&mut test_out).unwrap();
+
+        assert_eq!(string_expected, str::from_utf8(&test_out.into_inner().unwrap()).unwrap());
     }
 
     #[test]
@@ -650,9 +735,9 @@ printf ( "Hello, World!" ) ;
         // The preprocessor places spaces between all operators
         let test_expected = "static char foo = 1 ;";
 
-        let mut preprocessor = Preprocessor::new(&mut test_in, &mut test_out);
+        let mut preprocessor = Preprocessor::new(&mut test_in, "");
 
-        preprocessor.run().unwrap();
+        preprocessor.run().unwrap().write_to(&mut test_out).unwrap();
 
         assert_eq!(test_expected, str::from_utf8(&test_out.into_inner().unwrap()).unwrap());
     }
@@ -663,9 +748,9 @@ printf ( "Hello, World!" ) ;
         let mut test_out = BufWriter::new(Vec::new());
         let test_expected = "static char foo = 1 ;";
 
-        let mut preprocessor = Preprocessor::new(&mut test_in, &mut test_out);
+        let mut preprocessor = Preprocessor::new(&mut test_in, "");
 
-        preprocessor.run().unwrap();
+        preprocessor.run().unwrap().write_to(&mut test_out).unwrap();
 
         assert_eq!(test_expected, str::from_utf8(&test_out.into_inner().unwrap()).unwrap());
     }
@@ -676,9 +761,9 @@ printf ( "Hello, World!" ) ;
         let mut test_out = BufWriter::new(Vec::new());
         let test_expected = "static char foo = 1 ;";
 
-        let mut preprocessor = Preprocessor::new(&mut test_in, &mut test_out);
+        let mut preprocessor = Preprocessor::new(&mut test_in, "");
 
-        preprocessor.run().unwrap();
+        preprocessor.run().unwrap().write_to(&mut test_out).unwrap();
 
         assert_eq!(test_expected, str::from_utf8(&test_out.into_inner().unwrap()).unwrap());
     }
@@ -689,9 +774,9 @@ printf ( "Hello, World!" ) ;
         let mut test_out = BufWriter::new(Vec::new());
         let test_expected = "static char foo = 1 + 123 + 12345 + 123 ;";
 
-        let mut preprocessor = Preprocessor::new(&mut test_in, &mut test_out);
+        let mut preprocessor = Preprocessor::new(&mut test_in, "");
 
-        preprocessor.run().unwrap();
+        preprocessor.run().unwrap().write_to(&mut test_out).unwrap();
 
         assert_eq!(test_expected, str::from_utf8(&test_out.into_inner().unwrap()).unwrap());
     }
@@ -702,9 +787,9 @@ printf ( "Hello, World!" ) ;
         let mut test_out = BufWriter::new(Vec::new());
         let test_expected = "static char foo = \"1\" + \"123\" + \"12345\" + \"123\" ;";
 
-        let mut preprocessor = Preprocessor::new(&mut test_in, &mut test_out);
+        let mut preprocessor = Preprocessor::new(&mut test_in, "");
 
-        preprocessor.run().unwrap();
+        preprocessor.run().unwrap().write_to(&mut test_out).unwrap();
 
         assert_eq!(test_expected, str::from_utf8(&test_out.into_inner().unwrap()).unwrap());
     }
@@ -715,9 +800,9 @@ printf ( "Hello, World!" ) ;
         let mut test_out = BufWriter::new(Vec::new());
         let test_expected = "static char foo = 1 + 1 ;";
 
-        let mut preprocessor = Preprocessor::new(&mut test_in, &mut test_out);
+        let mut preprocessor = Preprocessor::new(&mut test_in, "");
 
-        preprocessor.run().unwrap();
+        preprocessor.run().unwrap().write_to(&mut test_out).unwrap();
 
         assert_eq!(test_expected, str::from_utf8(&test_out.into_inner().unwrap()).unwrap());
     }
@@ -728,9 +813,9 @@ printf ( "Hello, World!" ) ;
         let mut test_out = BufWriter::new(Vec::new());
         let test_expected = "static char * foo = \"boo\" \"\\\"bat\" ;";
 
-        let mut preprocessor = Preprocessor::new(&mut test_in, &mut test_out);
+        let mut preprocessor = Preprocessor::new(&mut test_in, "");
 
-        preprocessor.run().unwrap();
+        preprocessor.run().unwrap().write_to(&mut test_out).unwrap();
 
         assert_eq!(test_expected, str::from_utf8(&test_out.into_inner().unwrap()).unwrap());
     }
@@ -741,9 +826,9 @@ printf ( "Hello, World!" ) ;
         let mut test_out = BufWriter::new(Vec::new());
         let test_expected = "static char foo = 123 + 1 + 12345 ;";
 
-        let mut preprocessor = Preprocessor::new(&mut test_in, &mut test_out);
+        let mut preprocessor = Preprocessor::new(&mut test_in, "");
 
-        preprocessor.run().unwrap();
+        preprocessor.run().unwrap().write_to(&mut test_out).unwrap();
 
         assert_eq!(test_expected, str::from_utf8(&test_out.into_inner().unwrap()).unwrap());
     }
@@ -751,10 +836,9 @@ printf ( "Hello, World!" ) ;
     #[test]
     fn test_preprocessor_error_directive() {
         let mut test_in = BufReader::new("#error \"foo\"".as_bytes());
-        let mut test_out = BufWriter::new(Vec::new());
         let test_expected = PreprocessorError::error_directive(1, "foo".to_string());
 
-        let mut preprocessor = Preprocessor::new(&mut test_in, &mut test_out);
+        let mut preprocessor = Preprocessor::new(&mut test_in, "");
 
         let result = preprocessor.run().unwrap_err();
 
