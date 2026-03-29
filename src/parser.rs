@@ -2,6 +2,10 @@ use std::{collections::HashMap, fmt::{Debug, Display, Formatter}, sync::{Arc, La
 
 use crate::preprocessor::{LineIndex, PpToken, PpTokens, PreprocessorOut, ValueType};
 
+pub fn parse(ppout: PreprocessorOut) -> Result<Vec<ParserToken>, ParserError> {
+    Parser::new(ppout).parse()
+}
+
 static KEYWORD_MAP: LazyLock<HashMap<&'static str, Keyword>> = LazyLock::new(|| {
     HashMap::from_iter([
         ("auto", Keyword::Auto),
@@ -489,8 +493,8 @@ pub struct FuncCall {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum ParserToken {
-    Block(Vec<Self>),
+pub enum ParserTokenValue {
+    Block(Vec<ParserToken>),
     IfStatement(Box<IfStatement>),
     FuncDefinition(Box<FuncDefinition>),
     FuncCall(Box<FuncCall>),
@@ -498,6 +502,46 @@ pub enum ParserToken {
     Number(String),
     StringLiteral(String),
     Return(Box<ParserToken>),
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ParserToken {
+    pub line_num: usize,
+    pub value: ParserTokenValue,
+}
+
+impl ParserToken {
+    pub fn block(line_num: usize, value: Vec<Self>) -> Self {
+        Self { line_num, value: ParserTokenValue::Block(value) }
+    }
+
+    pub fn if_statement(line_num: usize, value: IfStatement) -> Self {
+        Self { line_num, value: ParserTokenValue::IfStatement(Box::new(value)) }
+    }
+    
+    pub fn func_definition(line_num: usize, value: FuncDefinition) -> Self {
+        Self { line_num, value: ParserTokenValue::FuncDefinition(Box::new(value)) }
+    }
+    
+    pub fn func_call(line_num: usize, value: FuncCall) -> Self {
+        Self { line_num, value: ParserTokenValue::FuncCall(Box::new(value)) }
+    }
+    
+    pub fn identifier(line_num: usize, value: String) -> Self {
+        Self { line_num, value: ParserTokenValue::Identifier(value) }
+    }
+    
+    pub fn number(line_num: usize, value: String) -> Self {
+        Self { line_num, value: ParserTokenValue::Number(value) }
+    }
+    
+    pub fn string_literal(line_num: usize, value: String) -> Self {
+        Self { line_num, value: ParserTokenValue::StringLiteral(value) }
+    }
+
+    pub fn treturn(line_num: usize, value: Self) -> Self {
+        Self { line_num, value: ParserTokenValue::Return(Box::new(value)) }
+    }
 }
 
 #[derive(Debug)]
@@ -593,7 +637,7 @@ impl Parser {
 
         let func_defintion =  FuncDefinition {return_type_specifier, identifier, parameters, block };
 
-        out.push(ParserToken::FuncDefinition(Box::new(func_defintion)));
+        out.push(ParserToken::func_definition(self.get_token_meta(i_param_start).line_num, func_defintion));
     
         Ok(())
     }
@@ -704,7 +748,7 @@ impl Parser {
 
         if statement_len == 1 {
             if matches!(first_token.value_type, ValueType::Numeric) {
-                return Ok(ParserToken::Number(first_token.value.clone()));
+                return Ok(ParserToken::number(self.get_token_meta(i_statement_start).line_num,first_token.value.clone()));
             }
             
             if matches!(first_token.value_type, ValueType::StringLiteral) {
@@ -717,7 +761,7 @@ impl Parser {
 
             match Keyword::from_token(first_token) {
                 None => {
-                    return Ok(ParserToken::Identifier(first_token.value.clone()));
+                    return Ok(ParserToken::identifier(self.get_token_meta(i_statement_start).line_num,first_token.value.clone()));
                 }
                 _ => {
                     return Err(ParserError::unexpected_token(self.get_token_meta(i_statement_start).line_num, &first_token.value));
@@ -729,7 +773,7 @@ impl Parser {
             let Some(keyword) = Keyword::from_token(&first_token) {
 
             match keyword {
-                Keyword::Return => { return Ok(ParserToken::Return(Box::new(self.parse_statement(i_next_token, i_statement_end)?))); },
+                Keyword::Return => { return Ok(ParserToken::treturn(self.get_token_meta(i_statement_start).line_num, self.parse_statement(i_next_token, i_statement_end)?)); },
                 _ => {
                     todo!();
                 }
@@ -807,7 +851,7 @@ impl Parser {
             result_string.push_str(&string_literal[i_string_start..i_string_end]);
         }
 
-        ParserToken::StringLiteral(result_string)
+        ParserToken::string_literal(self.get_token_meta(i_first_literal).line_num,result_string)
     }
 
     fn parse_function_call(&self, i_fc_start: usize, i_fc_params: usize, i_fc_end: usize) -> Result<ParserToken, ParserError> {
@@ -825,7 +869,7 @@ impl Parser {
                 params,
             };
 
-            return Ok(ParserToken::FuncCall(Box::new(func_call)));
+            return Ok(ParserToken::func_call(self.get_token_meta(i_fc_start).line_num, func_call));
         }
 
         let mut i_next_token = i_token;
@@ -860,7 +904,7 @@ impl Parser {
             params,
         };
 
-        Ok(ParserToken::FuncCall(Box::new(func_call)))
+        Ok(ParserToken::func_call(self.get_token_meta(i_fc_start).line_num, func_call))
     }
 
     fn parse_op(&self, string: &str) -> Result<Operator, ParserError> {
@@ -966,7 +1010,7 @@ impl Parser {
     fn get_token_meta(&self, i_token: usize) -> LineIndex {
         let mut i_line_start = 0;
         for line_index in self.line_indexes.iter() {
-            if i_line_start < i_token && line_index.i_line_end > i_token {
+            if i_line_start <= i_token && line_index.i_line_end > i_token {
                 return line_index.clone();
             }
 
@@ -1001,16 +1045,16 @@ int main(void) {
             identifier: "main".to_string(),
             parameters: Vec::new(),
             block: vec![
-                ParserToken::FuncCall(Box::new(FuncCall {
-                    call: ParserToken::Identifier("printf".to_string()),
+                ParserToken::func_call(3, FuncCall {
+                    call: ParserToken::identifier(3, "printf".to_string()),
                     params: vec![
-                        ParserToken::StringLiteral("Hello, World!".to_string()),
+                        ParserToken::string_literal(3, "Hello, World!".to_string()),
                     ]
-                })),
+                }),
             ],
         };
 
-        let test_expected = vec![ParserToken::FuncDefinition(Box::new(func_def))];
+        let test_expected = vec![ParserToken::func_definition(2, func_def)];
 
         let test_out = Parser::new(preprocess(&mut test_in, "").unwrap()).parse().unwrap();
 
@@ -1029,7 +1073,7 @@ int main(void) {
             block: Vec::new(),
         };
 
-        let test_expected = vec![ParserToken::FuncDefinition(Box::new(func_def))];
+        let test_expected = vec![ParserToken::func_definition(1, func_def)];
 
         let test_out_1 = Parser::new(preprocess(&mut test_in_1, "").unwrap()).parse().unwrap();
         let test_out_2 = Parser::new(preprocess(&mut test_in_2, "").unwrap()).parse().unwrap();
@@ -1047,10 +1091,10 @@ int main(void) {
             return_type_specifier: TypeSpecifier { is_const: false, indir_is_const: false, is_volatile: false, pointer_indirections: 0, ctype: Type::Int },
             identifier: "foo".to_string(),
             parameters: Vec::new(),
-            block: vec![ParserToken::Return(Box::new(ParserToken::Number("2".to_string())))],
+            block: vec![ParserToken::treturn(1, ParserToken::number(1, "2".to_string()))],
         };
 
-        let test_expected = vec![ParserToken::FuncDefinition(Box::new(func_def))];
+        let test_expected = vec![ParserToken::func_definition(1, func_def)];
 
         let test_out_1 = Parser::new(preprocess(&mut test_in_1, "").unwrap()).parse().unwrap();
         let test_out_2 = Parser::new(preprocess(&mut test_in_2, "").unwrap()).parse().unwrap();
@@ -1079,10 +1123,10 @@ int main(void) {
                     },
                 },
             ],
-            block: vec![ParserToken::Return(Box::new(ParserToken::Identifier("i".to_string())))],
+            block: vec![ParserToken::treturn(1, ParserToken::identifier(1, "i".to_string()))],
         };
 
-        let test_expected = vec![ParserToken::FuncDefinition(Box::new(func_def))];
+        let test_expected = vec![ParserToken::func_definition(1, func_def)];
 
         let test_out = Parser::new(preprocess(&mut test_in, "").unwrap()).parse().unwrap();
 
@@ -1105,16 +1149,16 @@ int main(void) {
             identifier: "main".to_string(),
             parameters: Vec::new(),
             block: vec![
-                ParserToken::FuncCall(Box::new(FuncCall {
-                    call: ParserToken::Identifier("foo".to_string()),
+                ParserToken::func_call(1, FuncCall {
+                    call: ParserToken::identifier(1, "foo".to_string()),
                     params: Vec::new(),
-                }))
+                })
             ],
         };
 
         let test_expected = vec![
-            ParserToken::FuncDefinition(Box::new(func_foo_def)),
-            ParserToken::FuncDefinition(Box::new(func_main_def)),
+            ParserToken::func_definition(1,func_foo_def),
+            ParserToken::func_definition(1,func_main_def),
         ];
 
         let test_out = Parser::new(preprocess(&mut test_in, "").unwrap()).parse().unwrap();
